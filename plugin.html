@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Distort Lab – Photopea</title>
+  <title>Distort Lab – Photopea Plugin</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root{
@@ -14,7 +14,7 @@
       margin:0; background:var(--panel); color:var(--text); text-align: center;
       font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
     }
-    .wrap{ padding:12px; width:100%; max-width:520px; margin: 0 auto; }
+    .wrap{ padding:12px; width:100%; max-width:520px; }
     h1{ font-size:16px; margin:0 0 6px; }
     p{ margin:0 0 10px; color:var(--muted); }
     .btn{
@@ -27,8 +27,8 @@
 <body>
   <div class="wrap">
     <h1>Distort Lab for Photopea</h1>
-    <p><img src="https://pt-home.github.io/Distort_Lab_for_Photopea/hamster.png" width="50%" alt="Distort Lab"></p>
-    <p>Send the active layer to Distort Lab, tweak distortions, then export back as a new document (or use the clipboard).</p>
+    <p><img src="https://pt-home.github.io/Distort_Lab_for_Photopea/hamster.png" width="50%">
+    <p>Send the active layer to Distort Lab, tweak distortions, then export back as a new Photopea document (or use a buffer). The plugin doesn't work in Vectorpea!</p>
     <button id="sendBtn" class="btn">Send to Lab</button>
     <div class="note" id="status"></div>
   </div>
@@ -37,13 +37,8 @@
   (function(){
     // ---------------- Config ----------------
     const LAB_URL = "https://pt-home.github.io/Distort_Lab_for_Photopea/";
+    const PHOTOPEA_ORIGIN = "https://www.photopea.com";
     const LAB_ORIGIN = "https://pt-home.github.io";
-
-    // Allow both Photopea and Vectorpea
-    const HOST_WHITELIST = new Set([
-      "https://www.photopea.com",
-      "https://www.vectorpea.com"
-    ]);
 
     // Handshake / retry timings
     const READY_TIMEOUT_MS   = 1800;
@@ -56,9 +51,8 @@
     let labWin = null;
     let labIsReady = false;
 
-    let hostOrigin = null;        // detected host origin (photopea or vectorpea)
     let pendingPng = null;        // last PNG buffer waiting to be delivered
-    let pendingName = "from-host.png";
+    let pendingName = "from-photopea.png";
     let pendingSeq = -1;          // seq number of the last send
     let seqCounter = 0;           // monotonically increasing sequence id
     let appliedTimer = null;      // retry timer handle
@@ -69,21 +63,9 @@
 
     // --------------- Logging helpers ---------------
     const L  = (...a)=>console.log("[DL-PLUGIN]", ...a);
-    const LP = (...a)=>console.log("%c[DL-HOST]", "color:#9aa0a6", ...a);
+    const LP = (...a)=>console.log("%c[DL-PP]", "color:#9aa0a6", ...a);
     const LL = (...a)=>console.log("%c[DL-LAB]", "color:#58a6ff", ...a);
     const setStatus = (m)=> statusEl.textContent = m;
-
-    // Try to guess host from referrer (works when embedded in host panel)
-    function guessHostOriginFromReferrer() {
-      try {
-        const ref = document.referrer || "";
-        if (!ref) return null;
-        const url = new URL(ref);
-        const origin = url.origin;
-        if (HOST_WHITELIST.has(origin)) return origin;
-      } catch(_) {}
-      return null;
-    }
 
     function ensureSession(){
       if (!sessionId) sessionId = "sess-" + Math.random().toString(36).slice(2);
@@ -112,19 +94,8 @@
       LL("→ LAB_OPEN", msg);
     }
 
-    // ---------------- Host scripting (Photopea / Vectorpea) ----------------
-    function askHostForActiveLayer(){
-      if (!hostOrigin) {
-        // Last chance: guess from referrer if not set yet
-        hostOrigin = guessHostOriginFromReferrer();
-        if (hostOrigin) {
-          L("Detected host from referrer:", hostOrigin);
-        } else {
-          setStatus("Host is unknown. Open this plugin inside Photopea or Vectorpea.");
-          return;
-        }
-      }
-
+    // ---------------- Clipboard-based layer export (Photopea) ----------------
+    function askPhotopeaForActiveLayer(){
       // Copy active layer → create temp doc with same params → paste → (trim) → saveToOE('png') → close
       const script = `
       (function(){
@@ -167,9 +138,9 @@
         }
       })();
       `;
-      window.parent.postMessage(script, hostOrigin);
-      setStatus("Requesting active layer from host…");
-      L("Requested active layer from host:", hostOrigin, "(copy→new→paste→OE).");
+      window.parent.postMessage(script, PHOTOPEA_ORIGIN);
+      setStatus("Requesting active layer from Photopea…");
+      L("Requested active layer from Photopea (copy→new→paste→OE).");
     }
 
     // ---------------- Send / Await APPLIED with seq ----------------
@@ -198,10 +169,11 @@
           return;
         }
         appliedTries++;
+        // Re-send same seq + same buffer
         if (labWin && !labWin.closed && pendingPng && pendingSeq >= 0) {
           labWin.postMessage({ type:"LAB_IMAGE", sessionId, seq: pendingSeq, mime:"image/png", name: pendingName, buffer: pendingPng }, LAB_ORIGIN);
           LL("→ LAB_IMAGE (retry, seq="+pendingSeq+")");
-          waitForAppliedThenFocus();
+          waitForAppliedThenFocus(); // set next wait
         }
       }, APPLIED_TIMEOUT_MS);
     }
@@ -221,39 +193,26 @@
     // ---------------- Events ----------------
     sendBtn.addEventListener("click", ()=>{
       ensureSession();
-      // If we don't know host yet, try to infer from referrer right away (best effort).
-      if (!hostOrigin) {
-        hostOrigin = guessHostOriginFromReferrer();
-        if (hostOrigin) {
-          L("Prefetched host from referrer:", hostOrigin);
-        }
-      }
       openOrFocusLab();
       sendLAB_OPEN();
-      askHostForActiveLayer();
+      askPhotopeaForActiveLayer();
     });
 
     window.addEventListener("message", (ev)=>{
-      // From host (Photopea / Vectorpea)
-      if (HOST_WHITELIST.has(ev.origin)) {
-        // First valid host message → lock hostOrigin
-        if (!hostOrigin) {
-          hostOrigin = ev.origin;
-          L("Host attached:", hostOrigin);
-        }
-
+      // From Photopea
+      if (ev.origin === PHOTOPEA_ORIGIN) {
         if (ev.data === "done") return;
 
         if (ev.data instanceof ArrayBuffer) {
           pendingPng = ev.data; // keep a copy (no ownership transfer)
-          LP("Host → plugin: ArrayBuffer", pendingPng.byteLength, "bytes");
-          setStatus("Image received from host.");
+          LP("Photopea → plugin: ArrayBuffer", pendingPng.byteLength, "bytes");
+          setStatus("Image received from Photopea.");
           waitForLabReadyThenSend();
           return;
         }
         if (typeof ev.data === "string") {
-          LP("Host:", ev.data);
-          setStatus("Host: " + ev.data);
+          LP("Photopea:", ev.data);
+          setStatus("Photopea: " + ev.data);
           return;
         }
       }
@@ -272,8 +231,10 @@
         }
 
         if (msg.type === "LAB_IMAGE_APPLIED") {
+          // Accept only if it's for the currently pending seq
           if (typeof msg.seq === "number" && msg.seq === pendingSeq) {
             LL("← LAB_IMAGE_APPLIED seq="+msg.seq);
+            // clear pending and cancel retry
             pendingPng = null;
             if (appliedTimer) { clearTimeout(appliedTimer); appliedTimer = null; }
             setStatus("Image applied in Distort Lab.");
@@ -286,17 +247,9 @@
 
         if (msg.type === "LAB_EXPORT" && msg.buffer instanceof ArrayBuffer) {
           LL("← LAB_EXPORT", msg.buffer.byteLength, "bytes");
-          if (!hostOrigin) {
-            hostOrigin = guessHostOriginFromReferrer();
-            if (!hostOrigin) {
-              setStatus("No host detected to export into.");
-              L("Export failed: hostOrigin unknown.");
-              return;
-            }
-          }
-          // Forward PNG back to the detected host as a new document
-          window.parent.postMessage(msg.buffer, hostOrigin, [msg.buffer]);
-          setStatus("Exported back to host as a new document.");
+          // Forward PNG to Photopea as a new document (no renaming)
+          window.parent.postMessage(msg.buffer, PHOTOPEA_ORIGIN, [msg.buffer]);
+          setStatus("Exported back to Photopea as a new document.");
           return;
         }
       }
